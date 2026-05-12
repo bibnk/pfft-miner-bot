@@ -1,0 +1,6 @@
+# Copy this file to wallet-keys.txt, then put ONE burner private key per line.
+# Do NOT commit wallet-keys.txt. It is ignored by git.
+# Example:
+# 0xPRIVATE_KEY_WALLET_1
+# 0xPRIVATE_KEY_WALLET_2
+# 0xPRIVATE_KEY_WALLET_3

@@ -2,7 +2,7 @@
 import { ethers } from 'ethers';
 import { randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import process from 'node:process';
 
 const CONTRACT_ADDRESS = '0xEFAd2Eab7172dDEbE5Ce7a41f5Ddf8fCcE4Ca0CB';
@@ -35,6 +35,8 @@ Usage:
 Env:
   PFFT_PRIVATE_KEY   Private key burner wallet for real mint
   PFFT_PRIVATE_KEYS  Optional comma/newline separated private keys for wallet rotation
+  PFFT_KEYS_FILE     Optional private key file, default ./wallet-keys.txt if it exists
+  PFFT_TX_PER_WALLET Rotate wallet after this many submitted txs, default 100
   PFFT_RPC_URL       Ethereum mainnet RPC URL (default publicnode)
   ETH_RPC_URL        Fallback RPC URL
 
@@ -50,6 +52,8 @@ Options:
   --retry-delay-ms N Delay after any mining/tx error, default 1000
   --no-wait-confirm Send tx, do not wait receipt before mining next nonce
   --max-pending N    Max pending txs in --no-wait-confirm mode, default 0 unlimited
+  --keys-file PATH   Load private keys from file, default env or ./wallet-keys.txt
+  --tx-per-wallet N  Rotate to next wallet after N submitted txs, default 100
   --stop-on-limit    Stop when wallet hits per-address mint limit (default for single wallet)
   --stop-on-error    Exit on first mining/tx error instead of retrying
 `);
@@ -92,10 +96,42 @@ function provider() {
 function readContract() {
   return new ethers.Contract(CONTRACT_ADDRESS, ABI, provider());
 }
-function privateKeys() {
-  const raw = process.env.PFFT_PRIVATE_KEYS || process.env.PFFT_PRIVATE_KEY || '';
-  const keys = raw.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
-  if (keys.length === 0) throw new Error('Set PFFT_PRIVATE_KEY or PFFT_PRIVATE_KEYS for mine command. Use burner wallet only.');
+function parseKeyList(raw) {
+  return raw
+    .split(/[\s,]+/)
+    .map(s => s.trim())
+    .filter(s => s && !s.startsWith('#'));
+}
+
+function readKeysFile(path) {
+  const raw = readFileSync(path, 'utf8')
+    .split(/\r?\n/)
+    .map(line => line.replace(/#.*$/, '').trim())
+    .filter(Boolean)
+    .join('\n');
+  return parseKeyList(raw);
+}
+
+function privateKeys(args = {}) {
+  const file = args['keys-file'] || process.env.PFFT_KEYS_FILE || (existsSync('./wallet-keys.txt') ? './wallet-keys.txt' : '');
+  let keys = [];
+  if (file) {
+    if (!existsSync(file)) throw new Error(`Private key file not found: ${file}`);
+    keys = readKeysFile(file);
+    if (keys.length === 0) throw new Error(`Private key file is empty: ${file}`);
+    console.log(`Loaded ${keys.length} private key(s) from ${file}`);
+  } else {
+    const raw = process.env.PFFT_PRIVATE_KEYS || process.env.PFFT_PRIVATE_KEY || '';
+    keys = parseKeyList(raw);
+  }
+  const seen = new Set();
+  keys = keys.filter(k => {
+    const norm = k.toLowerCase();
+    if (seen.has(norm)) return false;
+    seen.add(norm);
+    return true;
+  });
+  if (keys.length === 0) throw new Error('Set PFFT_PRIVATE_KEY/PFFT_PRIVATE_KEYS or create ./wallet-keys.txt. Use burner wallet only.');
   return keys;
 }
 function walletContract(privateKey) {
@@ -242,20 +278,34 @@ async function mine(args) {
   const stopOnError = !!args['stop-on-error'];
   const noWaitConfirm = !!args['no-wait-confirm'];
   const maxPending = args['max-pending'] === undefined ? 0 : Math.max(0, Number(args['max-pending']));
-  const keys = privateKeys();
+  const keys = privateKeys(args);
+  const txPerWallet = args['tx-per-wallet'] === undefined ? Math.max(1, Number(process.env.PFFT_TX_PER_WALLET || 100)) : Math.max(1, Number(args['tx-per-wallet']));
   let walletIndex = 0;
   let { wallet, contract } = walletContract(keys[walletIndex]);
   const limitedWallets = new Set();
+  const walletSubmitted = new Map();
 
-  function switchWallet() {
+  function walletSubmittedCount(address = wallet.address) {
+    return walletSubmitted.get(address.toLowerCase()) || 0;
+  }
+
+  function markWalletSubmitted(address = wallet.address) {
+    const key = address.toLowerCase();
+    const next = (walletSubmitted.get(key) || 0) + 1;
+    walletSubmitted.set(key, next);
+    return next;
+  }
+
+  function switchWallet(reason = 'rotate') {
     for (let i = 1; i <= keys.length; i++) {
       const idx = (walletIndex + i) % keys.length;
       const next = walletContract(keys[idx]);
-      if (!limitedWallets.has(next.wallet.address.toLowerCase())) {
+      const nextAddress = next.wallet.address.toLowerCase();
+      if (!limitedWallets.has(nextAddress) && walletSubmittedCount(next.wallet.address) < txPerWallet) {
         walletIndex = idx;
         wallet = next.wallet;
         contract = next.contract;
-        console.log(`Switch wallet: ${wallet.address} (${walletIndex + 1}/${keys.length})`);
+        console.log(`Switch wallet: ${wallet.address} (${walletIndex + 1}/${keys.length}) | reason: ${reason} | tx ${walletSubmittedCount(wallet.address)}/${txPerWallet}`);
         return true;
       }
     }
@@ -266,7 +316,7 @@ async function mine(args) {
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
   console.log(`Mode: ${dryRun ? 'dry-run (no tx)' : 'real mint'}`);
   console.log(`Confirm wait: ${noWaitConfirm ? `OFF / async receipts${maxPending > 0 ? ` / max pending ${maxPending}` : ''}` : 'ON'}`);
-  console.log(`Wallet rotation: ${keys.length} wallet(s)`);
+  console.log(`Wallet rotation: ${keys.length} wallet(s) | tx per wallet: ${txPerWallet}`);
   console.log(`Retry: ${stopOnError ? 'stop on error' : `auto-retry after ${retryDelayMs}ms`}`);
   let done = 0;
   let errors = 0;
@@ -350,15 +400,26 @@ async function mine(args) {
         }
       }
       await waitForPendingSlot();
+      const txWallet = wallet.address;
       const tx = await contract.freeMint(found.nonce, overrides);
+      const sentForWallet = markWalletSubmitted(txWallet);
       stats.submitted++;
       stats.pending++;
-      console.log(`Tx sent: ${tx.hash}`);
+      console.log(`Tx sent: ${tx.hash} | wallet ${txWallet} | walletTx ${sentForWallet}/${txPerWallet}`);
       if (noWaitConfirm) {
         trackReceipt(tx);
         done++;
         errors = 0;
         printStats(stats);
+        if (sentForWallet >= txPerWallet) {
+          limitedWallets.add(txWallet.toLowerCase());
+          if (!switchWallet(`tx-per-wallet ${txPerWallet}`)) {
+            const rotateMsg = `All ${keys.length} wallet(s) reached tx-per-wallet ${txPerWallet}. Stop mining; add more keys or increase --tx-per-wallet.`;
+            console.error(rotateMsg);
+            if (pendingReceipts.size > 0) await Promise.allSettled([...pendingReceipts]);
+            return;
+          }
+        }
         continue;
       }
       const rcpt = await tx.wait();
@@ -372,13 +433,20 @@ async function mine(args) {
       done++;
       errors = 0;
       printStats(stats);
+      if (sentForWallet >= txPerWallet) {
+        limitedWallets.add(txWallet.toLowerCase());
+        if (!switchWallet(`tx-per-wallet ${txPerWallet}`)) {
+          console.error(`All ${keys.length} wallet(s) reached tx-per-wallet ${txPerWallet}. Stop mining; add more keys or increase --tx-per-wallet.`);
+          return;
+        }
+      }
     } catch (e) {
       errors++;
       const msg = e.shortMessage || e.reason || e.message || String(e);
       if (e instanceof AddressLimitError) {
         limitedWallets.add(wallet.address.toLowerCase());
         console.error(msg);
-        if (switchWallet()) {
+        if (switchWallet('address limit')) {
           errors = 0;
           printStats(stats);
           continue;

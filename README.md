@@ -69,9 +69,34 @@ RTX 5090 / Blackwell butuh CUDA baru. VPS kamu tertulis Max CUDA 13.2, jadi seha
 
 ## Config
 
+Single wallet via env:
+
 ```bash
 export PFFT_RPC_URL="https://ethereum-rpc.publicnode.com"
 export PFFT_PRIVATE_KEY="PRIVATE_KEY_BURNER_WALLET"
+```
+
+Multi-wallet via file, rekomendasi untuk rotate otomatis:
+
+```bash
+cd /root/pfft-miner-bot
+cp wallet-keys.example.txt wallet-keys.txt
+nano wallet-keys.txt
+chmod 600 wallet-keys.txt
+```
+
+Isi `wallet-keys.txt` satu private key per baris:
+
+```text
+0xPRIVATE_KEY_WALLET_1
+0xPRIVATE_KEY_WALLET_2
+0xPRIVATE_KEY_WALLET_3
+```
+
+Default miner akan baca `./wallet-keys.txt` kalau file itu ada. Bisa juga pilih file custom:
+
+```bash
+node pfft-miner.mjs mine --gpu --keys-file /root/pfft-miner-bot/wallet-keys.txt
 ```
 
 Disarankan pakai RPC premium/low latency, bukan public RPC.
@@ -94,6 +119,18 @@ node pfft-miner.mjs mine --gpu --dry-run --count 1
 
 ```bash
 node pfft-miner.mjs mine --gpu --count 1
+```
+
+Mode cepat + auto rotate wallet setiap 100 tx terkirim:
+
+```bash
+node pfft-miner.mjs mine --gpu --count 0 --retry-delay-ms 0 --gas-limit 500000 --no-wait-confirm --max-pending 2 --tx-per-wallet 100
+```
+
+Kalau wallet sudah 100 tx, log akan seperti:
+
+```text
+Switch wallet: 0x... (2/5) | reason: tx-per-wallet 100 | tx 0/100
 ```
 
 Dengan gas manual:

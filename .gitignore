@@ -1,4 +1,6 @@
 node_modules/
 .env
+wallet-keys.txt
+private-keys.txt
 *.log
 .DS_Store
