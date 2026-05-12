@@ -99,7 +99,13 @@ node pfft-miner.mjs mine --gpu --count 1
 Dengan gas manual:
 
 ```bash
-node pfft-miner.mjs mine --gpu --count 1 --max-fee-gwei 3 --priority-gwei 0.2
+node pfft-miner.mjs mine --gpu --count 1 --max-fee-gwei 3 --priority-gwei 0.2 --gas-limit 350000
+```
+
+Catatan: kalau muncul `transaction execution reverted` dan receipt `gasUsed == gasLimit`, itu biasanya **out of gas**, bukan nonce salah. Miner sekarang otomatis pakai `max(estimate*2, 350000)`, tapi kamu bisa override:
+
+```bash
+node pfft-miner.mjs mine --gpu --count 0 --gas-limit 500000
 ```
 
 Mint berkali-kali:

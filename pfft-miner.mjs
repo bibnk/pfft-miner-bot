@@ -45,6 +45,7 @@ Options:
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
+  --gas-limit N      Gas limit override, default max(estimate*2, 350000)
 `);
 }
 
@@ -216,6 +217,19 @@ async function mine(args) {
     const overrides = {};
     if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
     if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
+    if (args['gas-limit']) {
+      overrides.gasLimit = BigInt(args['gas-limit']);
+    } else {
+      try {
+        const estimated = await contract.freeMint.estimateGas(found.nonce);
+        overrides.gasLimit = estimated * 2n;
+        if (overrides.gasLimit < 350000n) overrides.gasLimit = 350000n;
+        console.log(`Gas limit: ${overrides.gasLimit.toString()} (estimate ${estimated.toString()})`);
+      } catch (e) {
+        overrides.gasLimit = 350000n;
+        console.log(`Gas estimate failed, using gas limit ${overrides.gasLimit.toString()}: ${e.shortMessage || e.message || e}`);
+      }
+    }
     const tx = await contract.freeMint(found.nonce, overrides);
     console.log(`Tx sent: ${tx.hash}`);
     const rcpt = await tx.wait();
