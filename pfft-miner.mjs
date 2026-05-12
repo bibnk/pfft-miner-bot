@@ -34,6 +34,7 @@ Usage:
 
 Env:
   PFFT_PRIVATE_KEY   Private key burner wallet for real mint
+  PFFT_PRIVATE_KEYS  Optional comma/newline separated private keys for wallet rotation
   PFFT_RPC_URL       Ethereum mainnet RPC URL (default publicnode)
   ETH_RPC_URL        Fallback RPC URL
 
@@ -49,6 +50,7 @@ Options:
   --retry-delay-ms N Delay after any mining/tx error, default 1000
   --no-wait-confirm Send tx, do not wait receipt before mining next nonce
   --max-pending N    Max pending txs in --no-wait-confirm mode, default 0 unlimited
+  --stop-on-limit    Stop when wallet hits per-address mint limit (default for single wallet)
   --stop-on-error    Exit on first mining/tx error instead of retrying
 `);
 }
@@ -59,7 +61,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help', 'gpu', 'stop-on-error', 'no-wait-confirm'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu', 'stop-on-error', 'no-wait-confirm', 'stop-on-limit'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -90,10 +92,14 @@ function provider() {
 function readContract() {
   return new ethers.Contract(CONTRACT_ADDRESS, ABI, provider());
 }
-function walletContract() {
-  const pk = process.env.PFFT_PRIVATE_KEY;
-  if (!pk) throw new Error('Set PFFT_PRIVATE_KEY for mine command. Use burner wallet only.');
-  const w = new ethers.Wallet(pk, provider());
+function privateKeys() {
+  const raw = process.env.PFFT_PRIVATE_KEYS || process.env.PFFT_PRIVATE_KEY || '';
+  const keys = raw.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+  if (keys.length === 0) throw new Error('Set PFFT_PRIVATE_KEY or PFFT_PRIVATE_KEYS for mine command. Use burner wallet only.');
+  return keys;
+}
+function walletContract(privateKey) {
+  const w = new ethers.Wallet(privateKey, provider());
   return { wallet: w, contract: new ethers.Contract(CONTRACT_ADDRESS, ABI, w) };
 }
 
@@ -216,6 +222,17 @@ class SkipTxError extends Error {
   }
 }
 
+class AddressLimitError extends SkipTxError {
+  constructor(message) {
+    super(message);
+    this.name = 'AddressLimitError';
+  }
+}
+
+function isAddressLimit(msg) {
+  return /Exceed per address limit/i.test(String(msg));
+}
+
 async function mine(args) {
   const count = args.count === undefined ? 1 : Number(args.count);
   const workers = args.workers ? Math.max(1, Number(args.workers)) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
@@ -225,11 +242,31 @@ async function mine(args) {
   const stopOnError = !!args['stop-on-error'];
   const noWaitConfirm = !!args['no-wait-confirm'];
   const maxPending = args['max-pending'] === undefined ? 0 : Math.max(0, Number(args['max-pending']));
-  const { wallet, contract } = walletContract();
-  console.log(`Wallet: ${wallet.address}`);
+  const keys = privateKeys();
+  let walletIndex = 0;
+  let { wallet, contract } = walletContract(keys[walletIndex]);
+  const limitedWallets = new Set();
+
+  function switchWallet() {
+    for (let i = 1; i <= keys.length; i++) {
+      const idx = (walletIndex + i) % keys.length;
+      const next = walletContract(keys[idx]);
+      if (!limitedWallets.has(next.wallet.address.toLowerCase())) {
+        walletIndex = idx;
+        wallet = next.wallet;
+        contract = next.contract;
+        console.log(`Switch wallet: ${wallet.address} (${walletIndex + 1}/${keys.length})`);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  console.log(`Wallet: ${wallet.address}${keys.length > 1 ? ` (1/${keys.length})` : ''}`);
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
   console.log(`Mode: ${dryRun ? 'dry-run (no tx)' : 'real mint'}`);
   console.log(`Confirm wait: ${noWaitConfirm ? `OFF / async receipts${maxPending > 0 ? ` / max pending ${maxPending}` : ''}` : 'ON'}`);
+  console.log(`Wallet rotation: ${keys.length} wallet(s)`);
   console.log(`Retry: ${stopOnError ? 'stop on error' : `auto-retry after ${retryDelayMs}ms`}`);
   let done = 0;
   let errors = 0;
@@ -291,7 +328,9 @@ async function mine(args) {
         await contract.freeMint.staticCall(found.nonce, { gasLimit: 1000000n });
         console.log('Preflight: staticCall OK');
       } catch (e) {
-        throw new SkipTxError(`Preflight failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
+        const reason = e.shortMessage || e.reason || e.message || e;
+        if (isAddressLimit(reason)) throw new AddressLimitError(`Wallet limit reached: ${wallet.address} | ${reason}`);
+        throw new SkipTxError(`Preflight failed, skip tx: ${reason}`);
       }
       const overrides = {};
       if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
@@ -305,7 +344,9 @@ async function mine(args) {
           if (overrides.gasLimit < 350000n) overrides.gasLimit = 350000n;
           console.log(`Gas limit: ${overrides.gasLimit.toString()} (estimate ${estimated.toString()})`);
         } catch (e) {
-          throw new SkipTxError(`Gas estimate failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
+          const reason = e.shortMessage || e.reason || e.message || e;
+          if (isAddressLimit(reason)) throw new AddressLimitError(`Wallet limit reached: ${wallet.address} | ${reason}`);
+          throw new SkipTxError(`Gas estimate failed, skip tx: ${reason}`);
         }
       }
       await waitForPendingSlot();
@@ -334,7 +375,19 @@ async function mine(args) {
     } catch (e) {
       errors++;
       const msg = e.shortMessage || e.reason || e.message || String(e);
-      if (e instanceof SkipTxError) {
+      if (e instanceof AddressLimitError) {
+        limitedWallets.add(wallet.address.toLowerCase());
+        console.error(msg);
+        if (switchWallet()) {
+          errors = 0;
+          printStats(stats);
+          continue;
+        }
+        const limitMsg = `All ${keys.length} wallet(s) reached per-address mint limit. Stop mining; add fresh burner wallet(s) in PFFT_PRIVATE_KEYS.`;
+        console.error(limitMsg);
+        printStats(stats);
+        if (args['stop-on-limit'] || keys.length <= 1 || !stopOnError) throw new Error(limitMsg);
+      } else if (e instanceof SkipTxError) {
         stats.skipped++;
         console.error(msg);
       } else {
