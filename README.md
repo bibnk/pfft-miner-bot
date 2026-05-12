@@ -115,7 +115,11 @@ Mint berkali-kali:
 node pfft-miner.mjs mine --gpu --count 5
 
 # infinite loop: mint terus sampai screen/process distop
+# kalau error/revert/RPC gagal, otomatis mining ulang
 node pfft-miner.mjs mine --gpu --count 0
+
+# retry langsung tanpa delay
+node pfft-miner.mjs mine --gpu --count 0 --retry-delay-ms 0
 
 # shortcut npm infinite loop
 npm run mine:gpu
@@ -140,7 +144,7 @@ cd /root/pfft-miner-bot
 export PFFT_RPC_URL="RPC_ETH_KAMU"
 export PFFT_PRIVATE_KEY="PRIVATE_KEY_BURNER_WALLET"
 
-screen -S pfft -dm bash -lc './start-gpu-loop.sh'
+screen -S pfft -dm bash -lc 'node pfft-miner.mjs mine --gpu --count 0 --retry-delay-ms 0 --gas-limit 500000 2>&1 | tee -a /root/pfft-miner.log'
 ```
 
 Cek log:

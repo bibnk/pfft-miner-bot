@@ -46,6 +46,8 @@ Options:
   --max-fee-gwei N   Optional maxFeePerGas override
   --priority-gwei N  Optional maxPriorityFeePerGas override
   --gas-limit N      Gas limit override, default max(estimate*2, 350000)
+  --retry-delay-ms N Delay after any mining/tx error, default 1000
+  --stop-on-error    Exit on first mining/tx error instead of retrying
 `);
 }
 
@@ -55,7 +57,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help', 'gpu'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu', 'stop-on-error'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -189,53 +191,72 @@ async function findNonceGpu({ challenge, target, bin }) {
   });
 }
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 async function mine(args) {
   const count = args.count === undefined ? 1 : Number(args.count);
   const workers = args.workers ? Math.max(1, Number(args.workers)) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
   const dryRun = !!args['dry-run'];
   const useGpu = !!args.gpu;
+  const retryDelayMs = args['retry-delay-ms'] === undefined ? 1000 : Math.max(0, Number(args['retry-delay-ms']));
+  const stopOnError = !!args['stop-on-error'];
   const { wallet, contract } = walletContract();
   console.log(`Wallet: ${wallet.address}`);
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
   console.log(`Mode: ${dryRun ? 'dry-run (no tx)' : 'real mint'}`);
+  console.log(`Retry: ${stopOnError ? 'stop on error' : `auto-retry after ${retryDelayMs}ms`}`);
   let done = 0;
+  let errors = 0;
   while (count === 0 || done < count) {
-    const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
-    console.log(`\nChallenge: ${challenge}`);
-    console.log(`Target: ${target.toString()}`);
-    const found = useGpu
-      ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'] })
-      : await findNonce({ challenge, target, workers });
-    const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
-    console.log(`Solved nonce: ${found.nonce.toString()}`);
-    console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
-    if (dryRun) {
-      console.log('Dry-run: transaction not sent.');
-      done++;
-      continue;
-    }
-    const overrides = {};
-    if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
-    if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
-    if (args['gas-limit']) {
-      overrides.gasLimit = BigInt(args['gas-limit']);
-    } else {
-      try {
-        const estimated = await contract.freeMint.estimateGas(found.nonce);
-        overrides.gasLimit = estimated * 2n;
-        if (overrides.gasLimit < 350000n) overrides.gasLimit = 350000n;
-        console.log(`Gas limit: ${overrides.gasLimit.toString()} (estimate ${estimated.toString()})`);
-      } catch (e) {
-        overrides.gasLimit = 350000n;
-        console.log(`Gas estimate failed, using gas limit ${overrides.gasLimit.toString()}: ${e.shortMessage || e.message || e}`);
+    try {
+      const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
+      console.log(`\nChallenge: ${challenge}`);
+      console.log(`Target: ${target.toString()}`);
+      const found = useGpu
+        ? await findNonceGpu({ challenge, target, bin: args['cuda-bin'] })
+        : await findNonce({ challenge, target, workers });
+      const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
+      console.log(`Solved nonce: ${found.nonce.toString()}`);
+      console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
+      if (dryRun) {
+        console.log('Dry-run: transaction not sent.');
+        done++;
+        errors = 0;
+        continue;
       }
+      const overrides = {};
+      if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
+      if (args['priority-gwei']) overrides.maxPriorityFeePerGas = ethers.parseUnits(String(args['priority-gwei']), 'gwei');
+      if (args['gas-limit']) {
+        overrides.gasLimit = BigInt(args['gas-limit']);
+      } else {
+        try {
+          const estimated = await contract.freeMint.estimateGas(found.nonce);
+          overrides.gasLimit = estimated * 2n;
+          if (overrides.gasLimit < 350000n) overrides.gasLimit = 350000n;
+          console.log(`Gas limit: ${overrides.gasLimit.toString()} (estimate ${estimated.toString()})`);
+        } catch (e) {
+          overrides.gasLimit = 350000n;
+          console.log(`Gas estimate failed, using gas limit ${overrides.gasLimit.toString()}: ${e.shortMessage || e.message || e}`);
+        }
+      }
+      const tx = await contract.freeMint(found.nonce, overrides);
+      console.log(`Tx sent: ${tx.hash}`);
+      const rcpt = await tx.wait();
+      if (rcpt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`);
+      console.log(`Mint confirmed: block ${rcpt.blockNumber}`);
+      done++;
+      errors = 0;
+    } catch (e) {
+      errors++;
+      const msg = e.shortMessage || e.reason || e.message || String(e);
+      console.error(`ERROR #${errors}: ${msg}`);
+      if (stopOnError) throw e;
+      console.error(`Retry mining again in ${retryDelayMs}ms...`);
+      if (retryDelayMs > 0) await sleep(retryDelayMs);
     }
-    const tx = await contract.freeMint(found.nonce, overrides);
-    console.log(`Tx sent: ${tx.hash}`);
-    const rcpt = await tx.wait();
-    if (rcpt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`);
-    console.log(`Mint confirmed: block ${rcpt.blockNumber}`);
-    done++;
   }
 }
 
