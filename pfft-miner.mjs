@@ -29,7 +29,7 @@ function usage() {
 
 Usage:
   node pfft-miner.mjs status [--address 0x...]
-  node pfft-miner.mjs mine [--count 1] [--workers 4] [--gpu] [--dry-run]
+  node pfft-miner.mjs mine [--count 1] [--workers 4] [--gpu] [--dry-run] [--no-wait-confirm]
   node pfft-miner.mjs selftest
 
 Env:
@@ -47,6 +47,8 @@ Options:
   --priority-gwei N  Optional maxPriorityFeePerGas override
   --gas-limit N      Gas limit override, default max(estimate*2, 350000)
   --retry-delay-ms N Delay after any mining/tx error, default 1000
+  --no-wait-confirm Send tx, do not wait receipt before mining next nonce
+  --max-pending N    Max pending txs in --no-wait-confirm mode, default 0 unlimited
   --stop-on-error    Exit on first mining/tx error instead of retrying
 `);
 }
@@ -57,7 +59,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) { args._.push(a); continue; }
     const key = a.slice(2);
-    if (['dry-run', 'help', 'gpu', 'stop-on-error'].includes(key)) { args[key] = true; continue; }
+    if (['dry-run', 'help', 'gpu', 'stop-on-error', 'no-wait-confirm'].includes(key)) { args[key] = true; continue; }
     args[key] = argv[++i];
   }
   return args;
@@ -200,6 +202,20 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+
+function printStats(stats) {
+  console.log(
+    `Stats | submitted ${stats.submitted} | success ${stats.confirmed} | failed ${stats.failed} | skipped ${stats.skipped} | errors ${stats.errors} | pending ${stats.pending}`
+  );
+}
+
+class SkipTxError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'SkipTxError';
+  }
+}
+
 async function mine(args) {
   const count = args.count === undefined ? 1 : Number(args.count);
   const workers = args.workers ? Math.max(1, Number(args.workers)) : Math.max(1, Math.min(8, Number(process.env.PFFT_WORKERS || 4)));
@@ -207,13 +223,50 @@ async function mine(args) {
   const useGpu = !!args.gpu;
   const retryDelayMs = args['retry-delay-ms'] === undefined ? 1000 : Math.max(0, Number(args['retry-delay-ms']));
   const stopOnError = !!args['stop-on-error'];
+  const noWaitConfirm = !!args['no-wait-confirm'];
+  const maxPending = args['max-pending'] === undefined ? 0 : Math.max(0, Number(args['max-pending']));
   const { wallet, contract } = walletContract();
   console.log(`Wallet: ${wallet.address}`);
   console.log(`Contract: ${CONTRACT_ADDRESS}`);
   console.log(`Mode: ${dryRun ? 'dry-run (no tx)' : 'real mint'}`);
+  console.log(`Confirm wait: ${noWaitConfirm ? `OFF / async receipts${maxPending > 0 ? ` / max pending ${maxPending}` : ''}` : 'ON'}`);
   console.log(`Retry: ${stopOnError ? 'stop on error' : `auto-retry after ${retryDelayMs}ms`}`);
   let done = 0;
   let errors = 0;
+  const stats = { submitted: 0, confirmed: 0, failed: 0, skipped: 0, errors: 0, pending: 0 };
+  const pendingReceipts = new Set();
+
+  function trackReceipt(tx) {
+    const p = (async () => {
+      try {
+        const rcpt = await tx.wait();
+        stats.pending--;
+        if (rcpt.status === 1) {
+          stats.confirmed++;
+          console.log(`Mint confirmed: ${tx.hash} block ${rcpt.blockNumber}`);
+        } else {
+          stats.failed++;
+          console.error(`Mint tx failed: ${tx.hash}`);
+        }
+      } catch (e) {
+        stats.pending--;
+        stats.failed++;
+        console.error(`Receipt failed: ${tx.hash} | ${e.shortMessage || e.reason || e.message || e}`);
+      } finally {
+        pendingReceipts.delete(p);
+        printStats(stats);
+      }
+    })();
+    pendingReceipts.add(p);
+  }
+
+  async function waitForPendingSlot() {
+    while (maxPending > 0 && pendingReceipts.size >= maxPending) {
+      console.log(`Pending tx full (${pendingReceipts.size}/${maxPending}), wait one receipt...`);
+      await Promise.race([...pendingReceipts]);
+    }
+  }
+
   while (count === 0 || done < count) {
     try {
       const [challenge, target] = await Promise.all([contract.currentPowChallenge(wallet.address), contract.POW_TARGET()]);
@@ -238,7 +291,7 @@ async function mine(args) {
         await contract.freeMint.staticCall(found.nonce, { gasLimit: 1000000n });
         console.log('Preflight: staticCall OK');
       } catch (e) {
-        throw new Error(`Preflight failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
+        throw new SkipTxError(`Preflight failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
       }
       const overrides = {};
       if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
@@ -252,24 +305,51 @@ async function mine(args) {
           if (overrides.gasLimit < 350000n) overrides.gasLimit = 350000n;
           console.log(`Gas limit: ${overrides.gasLimit.toString()} (estimate ${estimated.toString()})`);
         } catch (e) {
-          throw new Error(`Gas estimate failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
+          throw new SkipTxError(`Gas estimate failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
         }
       }
+      await waitForPendingSlot();
       const tx = await contract.freeMint(found.nonce, overrides);
+      stats.submitted++;
+      stats.pending++;
       console.log(`Tx sent: ${tx.hash}`);
+      if (noWaitConfirm) {
+        trackReceipt(tx);
+        done++;
+        errors = 0;
+        printStats(stats);
+        continue;
+      }
       const rcpt = await tx.wait();
-      if (rcpt.status !== 1) throw new Error(`Mint tx failed: ${tx.hash}`);
+      stats.pending--;
+      if (rcpt.status !== 1) {
+        stats.failed++;
+        throw new Error(`Mint tx failed: ${tx.hash}`);
+      }
+      stats.confirmed++;
       console.log(`Mint confirmed: block ${rcpt.blockNumber}`);
       done++;
       errors = 0;
+      printStats(stats);
     } catch (e) {
       errors++;
       const msg = e.shortMessage || e.reason || e.message || String(e);
-      console.error(`ERROR #${errors}: ${msg}`);
+      if (e instanceof SkipTxError) {
+        stats.skipped++;
+        console.error(msg);
+      } else {
+        stats.errors++;
+        console.error(`ERROR #${errors}: ${msg}`);
+      }
+      printStats(stats);
       if (stopOnError) throw e;
       console.error(`Retry mining again in ${retryDelayMs}ms...`);
       if (retryDelayMs > 0) await sleep(retryDelayMs);
     }
+  }
+  if (pendingReceipts.size > 0) {
+    console.log(`Waiting ${pendingReceipts.size} pending receipt(s) before exit...`);
+    await Promise.allSettled([...pendingReceipts]);
   }
 }
 
