@@ -137,7 +137,7 @@ static int parse_hex32(const char *hex, uint8_t out[32]) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "Usage: %s <challenge_bytes32_hex> <target_hex_or_decimal> [blocks] [threads] [iters_per_thread]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <challenge_bytes32_hex> <target_hex_or_decimal> [blocks] [threads] [iters_per_thread] [start_nonce_u64]\n", argv[0]);
         return 2;
     }
     uint8_t challenge[32], target[32];
@@ -177,7 +177,7 @@ int main(int argc, char **argv) {
     cudaMemset(d_found, 0, sizeof(unsigned long long)); cudaMemset(d_nonce, 0, sizeof(unsigned long long));
 
     fprintf(stderr, "device=%s blocks=%d threads=%d stride=%llu iters=%llu\n", prop.name, blocks, threads, (unsigned long long)stride, (unsigned long long)iters);
-    uint64_t start = (uint64_t)time(NULL) * 1000003ULL;
+    uint64_t start = argc > 6 ? strtoull(argv[6], NULL, 10) : ((uint64_t)time(NULL) * 1000003ULL);
     unsigned long long found = 0, nonce = 0;
     unsigned long long batches = 0;
     while (!found) {

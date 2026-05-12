@@ -120,7 +120,16 @@ node pfft-miner.mjs mine --gpu --count 0
 
 # retry langsung tanpa delay
 node pfft-miner.mjs mine --gpu --count 0 --retry-delay-ms 0
+```
 
+Preflight sebelum kirim tx:
+
+- validasi hash nonce lokal
+- `staticCall freeMint(nonce)` dulu
+- kalau `Duplicate POW nonce`, `Invalid POW`, revert, atau estimate gas gagal → **tidak kirim tx**, langsung mining nonce baru
+- CUDA start nonce dibuat random tiap percobaan supaya tidak mengulang nonce lama
+
+```bash
 # shortcut npm infinite loop
 npm run mine:gpu
 ```

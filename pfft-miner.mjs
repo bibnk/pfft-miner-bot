@@ -40,7 +40,7 @@ Env:
 Options:
   --count N          Number of successful mints, default 1, use 0 for infinite
   --workers N        Parallel CPU workers in this process, default CPU count-ish
-  --gpu              Use CUDA solver ./build/pfft-cuda-miner (run make cuda first)
+  --gpu              Use CUDA solver ./build/pfft-cuda-miner (run make cuda first; rebuild after git pull)
   --cuda-bin PATH    Custom CUDA solver path
   --dry-run          Find valid PoW nonce but do not send transaction
   --max-fee-gwei N   Optional maxFeePerGas override
@@ -97,6 +97,9 @@ function walletContract() {
 
 function randomUint256() {
   return BigInt('0x' + randomBytes(32).toString('hex'));
+}
+function randomUint64() {
+  return randomBytes(8).readBigUInt64BE(0);
 }
 function powHash(challenge, nonce) {
   // Matches site worker: ethers.solidityPackedKeccak256(['bytes32','uint256'], [challenge, nonce])
@@ -173,10 +176,12 @@ async function findNonceGpu({ challenge, target, bin }) {
   bin ||= process.env.PFFT_CUDA_BIN || './build/pfft-cuda-miner';
   if (!existsSync(bin)) throw new Error(`CUDA solver not found: ${bin}. Build with: make cuda`);
   const targetHex = uint256Hex(target);
+  const startNonce = randomUint64();
   console.log(`CUDA solver: ${bin}`);
+  console.log(`CUDA start nonce: ${startNonce.toString()}`);
   const started = Date.now();
   return await new Promise((resolve, reject) => {
-    const child = spawn(bin, [challenge, targetHex], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(bin, [challenge, targetHex, '0', '256', '4096', startNonce.toString()], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.on('data', d => { out += d.toString(); });
     child.stderr.on('data', d => { process.stderr.write(d); });
@@ -220,11 +225,20 @@ async function mine(args) {
       const rate = Number(found.attempts) / Math.max(found.elapsedMs / 1000, 0.001);
       console.log(`Solved nonce: ${found.nonce.toString()}`);
       console.log(`Worker: ${found.worker} | Attempts: ${found.attempts.toLocaleString()} | Rate: ${fmtRate(rate)}`);
+      if (!validPow(challenge, found.nonce, target)) {
+        throw new Error(`Local POW verification failed for nonce ${found.nonce.toString()}`);
+      }
       if (dryRun) {
         console.log('Dry-run: transaction not sent.');
         done++;
         errors = 0;
         continue;
+      }
+      try {
+        await contract.freeMint.staticCall(found.nonce, { gasLimit: 1000000n });
+        console.log('Preflight: staticCall OK');
+      } catch (e) {
+        throw new Error(`Preflight failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
       }
       const overrides = {};
       if (args['max-fee-gwei']) overrides.maxFeePerGas = ethers.parseUnits(String(args['max-fee-gwei']), 'gwei');
@@ -238,8 +252,7 @@ async function mine(args) {
           if (overrides.gasLimit < 350000n) overrides.gasLimit = 350000n;
           console.log(`Gas limit: ${overrides.gasLimit.toString()} (estimate ${estimated.toString()})`);
         } catch (e) {
-          overrides.gasLimit = 350000n;
-          console.log(`Gas estimate failed, using gas limit ${overrides.gasLimit.toString()}: ${e.shortMessage || e.message || e}`);
+          throw new Error(`Gas estimate failed, skip tx: ${e.shortMessage || e.reason || e.message || e}`);
         }
       }
       const tx = await contract.freeMint(found.nonce, overrides);
